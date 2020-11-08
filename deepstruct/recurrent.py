@@ -1,11 +1,14 @@
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 
 from torch.autograd import Variable
 from torch.nn import Parameter
 from torch.nn import init
+
+from deepstruct.graph import LayeredGraph
 
 
 class BaseRecurrentLayer(nn.Module):
@@ -245,6 +248,8 @@ class MaskedDeepRNN(BaseMaskModule):
         input_size: The number of expected features in the input
         hidden_layers: A list specifying number of expected features in each hidden layer
             (E.g, hidden_layers=[50, 50] specifies model consisting two hidden layers with 50 features each)
+        build_recurrent_layer: Type of recurrent layer to use
+            (MaskedRecurrentLayer or MaskedGRULayer or MaskedLSTMLayer)
         nonlinearity: Can be a usual non-linearity such as torch.nn.ReLU() or torch.nn.Tanh()
         batch_first: If True, then the input and output tensors are provided
             as (batch, seq, feature). Default: False
@@ -286,6 +291,124 @@ class MaskedDeepRNN(BaseMaskModule):
                 batch_size, hidden_size, dtype=input.dtype, device=input.device
             )
             input = layer.unfold(input, hx)
+
+        output = input[:, -1, :] if self._batch_first else input[-1]
+        return output
+
+
+class MaskedDeepRDAN(nn.Module):
+    def __init__(
+        self,
+        input_size,
+        structure: LayeredGraph,
+        build_recurrent_layer=MaskedRecurrentLayer,
+        nonlinearity=torch.nn.Tanh(),
+        batch_first=False,
+    ):
+        super(MaskedDeepRDAN, self).__init__()
+
+        self._input_size = input_size
+        self._structure = structure
+        self._batch_first = batch_first
+
+        gates = (
+            1
+            if build_recurrent_layer == "MaskedRecurrentLayer"
+            else 3
+            if build_recurrent_layer == "MaskedGRULayer"
+            else 4
+        )
+
+        assert callable(nonlinearity)
+        assert structure.num_layers > 0
+
+        layer_list = []
+        for layer_idx, layer in enumerate(structure.layers):
+            input_size = input_size if layer_idx == 0 else structure.get_layer_size(layer_idx - 1)
+            layer_list.append(
+                build_recurrent_layer(
+                    input_size,
+                    structure.get_layer_size(layer_idx),
+                    batch_first,
+                    nonlinearity=nonlinearity,
+                )
+            )
+
+        self._recurrent_layers = nn.ModuleList(layer_list)
+
+        for layer_idx, layer in zip(structure.layers[1:], self._recurrent_layers[1:]):
+            mask = torch.zeros(
+                structure.get_layer_size(layer_idx),
+                structure.get_layer_size(layer_idx - 1),
+            )
+            for source_idx, source_vertex in enumerate(
+                structure.get_vertices(layer_idx - 1)
+            ):
+                for target_idx, target_vertex in enumerate(
+                    structure.get_vertices(layer_idx)
+                ):
+                    if structure.has_edge(source_vertex, target_vertex):
+                        mask[target_idx][source_idx] = 1
+            mask = np.repeat(mask, gates, 0)
+            layer.set_i2h_mask(mask)
+
+        skip_layers = []
+        self._skip_targets = {}
+        for target_layer in structure.layers[2:]:
+            target_size = structure.get_layer_size(target_layer)
+            for distant_source_layer in structure.layers[: target_layer - 1]:
+                if structure.layer_connected(distant_source_layer, target_layer):
+                    if target_layer not in self._skip_targets:
+                        self._skip_targets[target_layer] = []
+
+                    skip_layer = build_recurrent_layer(
+                        structure.get_layer_size(distant_source_layer),
+                        target_size,
+                        batch_first,
+                        nonlinearity=nonlinearity,
+                    )
+                    mask = torch.zeros(
+                        structure.get_layer_size(target_layer),
+                        structure.get_layer_size(distant_source_layer),
+                    )
+                    for source_idx, source_vertex in enumerate(
+                        structure.get_vertices(distant_source_layer)
+                    ):
+                        for target_idx, target_vertex in enumerate(
+                            structure.get_vertices(target_layer)
+                        ):
+                            if structure.has_edge(source_vertex, target_vertex):
+                                mask[target_idx][source_idx] = 1
+                    mask = np.repeat(mask, gates, 0)
+                    skip_layer.set_i2h_mask(mask)
+
+                    skip_layers.append(skip_layer)
+                    self._skip_targets[target_layer].append(
+                        {"layer": skip_layer, "source": distant_source_layer}
+                    )
+        self.skip_layers = nn.ModuleList(skip_layers)
+
+    def forward(self, input):
+        batch_size = input.size(0) if self._batch_first else input.size(1)
+
+        layer_results = dict()
+        for layer, layer_idx in zip(self._recurrent_layers, self._structure.layers):
+            hx = torch.zeros(
+                batch_size,
+                self._structure.get_layer_size(layer_idx),
+                dtype=input.dtype,
+                device=input.device,
+            )
+            input = layer.unfold(input, hx)
+
+            if layer_idx in self._skip_targets:
+                for skip_target in self._skip_targets[layer_idx]:
+                    source_layer = skip_target["layer"]
+                    source_idx = skip_target["source"]
+
+                    input += source_layer.unfold(layer_results[source_idx], hx)
+
+            layer_results[layer_idx] = input
 
         output = input[:, -1, :] if self._batch_first else input[-1]
         return output
